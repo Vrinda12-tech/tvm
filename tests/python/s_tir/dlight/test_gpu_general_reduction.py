@@ -17,6 +17,8 @@
 # pylint: disable=missing-docstring
 # ruff: noqa: E501, F841
 
+import re
+
 import tvm_tirx
 import tvm_tirx.testing
 from tvm.s_tir import dlight as dl
@@ -758,6 +760,85 @@ def test_logsumexp():
                             )
 
     _check(Before, After)
+
+
+def _make_pool_add(pool):
+    """`pool` x `pool` max-pool (reduction extent pool*pool) fused with an elementwise add."""
+
+    @I.ir_module
+    class Before:
+        @Ts.function
+        def main(
+            A: T.Tensor((1, 144, 32 * pool, 32 * pool), "float32"),
+            B: T.Tensor((1, 144, 32, 32), "float32"),
+            Output: T.Tensor((1, 144, 32, 32), "float32"),
+        ):
+            T.func_attr({"tirx.noalias": True})
+            pooled = Ts.sblock_alloc_tensor((1, 144, 32, 32), "float32")
+            for n, c, oh, ow, rh, rw in T.grid(1, 144, 32, 32, pool, pool):
+                with Ts.sblock("pool_max"):
+                    v_n, v_c, v_oh, v_ow, v_rh, v_rw = Ts.axis.remap(
+                        "SSSSRR", [n, c, oh, ow, rh, rw]
+                    )
+                    Ts.reads(A[v_n, v_c, v_oh * pool + v_rh, v_ow * pool + v_rw])
+                    Ts.writes(pooled[v_n, v_c, v_oh, v_ow])
+                    with Ts.init():
+                        pooled[v_n, v_c, v_oh, v_ow] = T.float32(-3.4028234663852886e38)
+                    pooled[v_n, v_c, v_oh, v_ow] = T.max(
+                        pooled[v_n, v_c, v_oh, v_ow],
+                        A[v_n, v_c, v_oh * pool + v_rh, v_ow * pool + v_rw],
+                    )
+            for n, c, oh, ow in T.grid(1, 144, 32, 32):
+                with Ts.sblock("add"):
+                    v_n, v_c, v_oh, v_ow = Ts.axis.remap("SSSS", [n, c, oh, ow])
+                    Ts.reads(pooled[v_n, v_c, v_oh, v_ow], B[v_n, v_c, v_oh, v_ow])
+                    Ts.writes(Output[v_n, v_c, v_oh, v_ow])
+                    Output[v_n, v_c, v_oh, v_ow] = (
+                        pooled[v_n, v_c, v_oh, v_ow] + B[v_n, v_c, v_oh, v_ow]
+                    )
+
+    return Before
+
+
+def _schedule_pool_add(pool):
+    target = Target("nvidia/geforce-rtx-3090-ti")
+    with target:
+        return dl.ApplyDefaultSchedule(  # pylint: disable=not-callable
+            dl.gpu.GeneralReduction(),
+        )(_make_pool_add(pool))
+
+
+def test_small_reduction_runs_serially_per_thread():
+    """A 2x2 max-pool fused with an add (apache/tvm#20401): reduction extent 4."""
+    mod = _schedule_pool_add(2)
+    scheduled = mod.script()
+    local = tvm_tirx.runtime.MemoryScope("local")
+    alloc = list(mod["main"].body[0].block.alloc_tensors)
+    # The pool result is thread-private: a register, not shared memory.
+    assert alloc and all(t.scope() == local for t in alloc)
+    assert 'scope="shared"' not in scheduled
+    # One output per thread: 144 * 32 * 32 / 256 = 576 blocks of 256 threads, no tail predicate.
+    assert re.search(
+    r'T\.parallel\((?:T\.int64\(0\),\s*)?T\.int64\(576\), annotations=\{"thread_binding": "blockIdx\.x"\}',
+    scheduled,
+    )
+    assert re.search(
+        r'T\.parallel\((?:T\.int64\(0\),\s*)?T\.int64\(256\), annotations=\{"thread_binding": "threadIdx\.x"\}',
+        scheduled,
+    )
+    assert "Ts.where" not in scheduled
+    # The reduction must be computed *inside* the thread loop. Computing it at the block
+    # loop makes every thread redo the reductions of all 256 outputs of its block.
+    assert scheduled.index('"threadIdx.x"') < scheduled.index('Ts.sblock("pool_max")')
+
+
+def test_reduction_above_small_threshold_keeps_cross_thread_schedule():
+    """A 17x17 pool has extent 289 > 256, so the default cross-thread schedule is kept."""
+    mod = _schedule_pool_add(17)
+    scheduled = mod.script()
+    shared = tvm_tirx.runtime.MemoryScope("shared")
+    alloc = list(mod["main"].body[0].block.alloc_tensors)
+    assert alloc and all(t.scope() == shared for t in alloc)
 
 
 if __name__ == "__main__":

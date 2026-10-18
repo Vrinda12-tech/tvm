@@ -24,11 +24,35 @@ from tvm_tirx import sym, tirx
 from tvm_tirx.runtime import MemoryScope
 from tvm_tirx.target import Target
 
-from ..analysis import get_root_block, normalize_function
-from ..base import try_inline_contiguous_spatial
+from ..analysis import SBlockInfo, get_root_block, normalize_function
+from ..base import get_extent, try_inline_contiguous_spatial
 from .base import GPUScheduleRule
 
 _SCOPE_GLOBAL = MemoryScope("global")
+
+# Reductions with at most this many elements are folded serially inside one thread
+# instead of being split across `len_tx` threads. A cross-thread reduction over
+# a small extent leaves most threads idle while still paying for a block per
+# output, shared memory, and warp shuffles.
+#
+# The crossover was measured on an RTX A6000(see #20401):
+# at extent 289, the serial schedule was 32.90 us vs 403.01 us for the
+# cross-thread schedule. 256 is `len_tx`, the point where one thread per
+# reduction element stops being applicable; the measurement confirms it is
+# still on the serial side of the crossover.
+_SMALL_REDUCTION_MAX_EXTENT = 256
+
+
+def _static_extent(block_info: SBlockInfo, kind: str) -> int | None:
+    """Product of the extents of the iterators of `kind` ("S" or "R"), or None if dynamic."""
+    extent = 1
+    for iter_info in block_info.iters:
+        if iter_info.kind != kind:
+            continue
+        if not isinstance(iter_info.dom, int):
+            return None
+        extent *= iter_info.dom
+    return extent
 
 
 class GeneralReduction(GPUScheduleRule):
@@ -190,6 +214,10 @@ class GeneralReduction(GPUScheduleRule):
                     other_loops.append(loop_rv)
             sch.reorder(*s_loops, *other_loops)
 
+        small_reduction = self._schedule_small_reduction(sch, block_infos, len_tx, unroll_depth)
+        if small_reduction is not None:
+            return small_reduction
+
         loops = sch.get_loops(block_infos[-1].block_rv)
         bx = sch.fuse(*loops[:num_leading_s])
         r_loop, tx = sch.split(loops[-1], [None, len_tx])
@@ -215,4 +243,77 @@ class GeneralReduction(GPUScheduleRule):
         # the pass lower-thread-allreduce. We should fix it in the future.
         # sch.annotate(bx, ann_key="tirx.auto_unroll_max_step", ann_val=unroll_depth)
         # sch.annotate(bx, ann_key="tirx.unroll_explicit", ann_val=1)
+        return sch
+
+    def _schedule_small_reduction(  # pylint: disable=too-many-locals
+        self,
+        sch: s_tir.Schedule,
+        block_infos: list[SBlockInfo],
+        len_tx: int,
+        unroll_depth: int,
+    ) -> s_tir.Schedule | None:
+        """Fold a small reduction serially inside each thread.
+
+        Splitting a reduction of a handful of elements across `len_tx` threads
+        leaves nearly every thread idle and launches one block per output. When the
+        reduction is small, one output per thread is better: each thread reduces
+        its own elements in a register and applies the epilogue.
+
+        Following Kennedy and McKinley (LCPC 1993), a fused schedule must not give up
+        parallelism, so this only applies when all of the following hold. Otherwise
+        it returns None, without touching `sch`, and the default path runs.
+
+        * every producer's reduction is static and at most `_SMALL_REDUCTION_MAX_EXTENT`;
+        * the outputs are static and fill at least one block of `len_tx` threads;
+        * every producer has exactly as many spatial elements as the final block, and
+          each later block reads a producer value at a single point. A producer
+          broadcast over a reduced axis (softmax, layer norm statistics) is therefore
+          left alone, since one-thread-per-output would recompute it per element.
+        """
+        producers = block_infos[:-1]
+        for info in producers:
+            reduction_extent = _static_extent(info, "R")
+            if reduction_extent is None or reduction_extent > _SMALL_REDUCTION_MAX_EXTENT:
+                return None
+
+        spatial_loops = sch.get_loops(block_infos[-1].block_rv)
+        num_outputs = 1
+        for loop_rv in spatial_loops:
+            extent = get_extent(sch, loop_rv)
+            if not isinstance(extent, int):
+                return None
+            num_outputs *= extent
+        if num_outputs < len_tx:
+            return None
+
+        analyzer = sym.Analyzer()
+        produced = []
+        for info in block_infos:
+            block = sch.get(info.block_rv)
+            for read in block.reads:
+                if any(read.source.same_as(t) for t in produced) and not all(
+                    analyzer.can_prove_equal(rng.extent, 1) for rng in read.region
+                ):
+                    return None
+            if info is not block_infos[-1]:
+                if _static_extent(info, "S") != num_outputs:
+                    return None
+                produced.extend(write.source for write in block.writes)
+
+        fused = sch.fuse(*spatial_loops)
+        bx, tx = sch.split(fused, [None, len_tx])
+        sch.bind(bx, "blockIdx.x")
+        sch.bind(tx, "threadIdx.x")
+
+        for info in reversed(producers):
+            block = info.block_rv
+            # Each thread owns its element, so keep it in a register, not shared memory.
+            for i, _ in enumerate(sch.get(block).writes):
+                sch.set_scope(block, tensor_index=i, storage_scope="local")
+            # Compute at the thread loop, not the block loop: computing at `bx` would
+            # make every thread redo the whole block's reductions.
+            sch.compute_at(block, tx, preserve_unit_loops=True)
+            inner_loops = sch.get_loops(block)
+            sch.annotate(inner_loops[-1], ann_key="tirx.auto_unroll_max_step", ann_val=unroll_depth)
+            sch.annotate(inner_loops[-1], ann_key="tirx.unroll_explicit", ann_val=1)
         return sch
